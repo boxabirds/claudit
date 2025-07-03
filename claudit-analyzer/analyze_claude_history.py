@@ -29,6 +29,9 @@ PRICE_PER_M_OUTPUT = 2.50
 # but even fairly long ones are only 6k or so so let's be conservative
 NOMINAL_REPORT_TOKEN_COUNT = 10_000
 
+# Minimal 1x1 transparent PNG as base64 placeholder
+PLACEHOLDER_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+
 MAX_OUTPUT_TOKENS = 65_535  # Conservative estimate for output
 ANALYSIS_PROMPT = """Analyze this Claude conversation history and identify:
 
@@ -201,6 +204,23 @@ def check_ambiguous_paths(munged_path: str) -> List[str]:
     return []
 
 
+def strip_base64_images(content: Any) -> Any:
+    """Recursively strip base64 images from content and replace with placeholder."""
+    if isinstance(content, str):
+        # Check if this is a base64 image data URL
+        if content.startswith("data:image/") and ";base64," in content:
+            # Extract the image type for the placeholder message
+            image_type = content.split(";")[0].split("/")[1]
+            return f"[IMAGE: {image_type} removed]"
+        return content
+    elif isinstance(content, list):
+        return [strip_base64_images(item) for item in content]
+    elif isinstance(content, dict):
+        return {key: strip_base64_images(value) for key, value in content.items()}
+    else:
+        return content
+
+
 def get_last_run_date(report_file: Path) -> Optional[datetime]:
     """Extract the last run date from an existing report."""
     if not report_file.exists():
@@ -301,15 +321,19 @@ def read_jsonl_files(project_dir: Path, since_date: Optional[datetime] = None) -
                         
                         # Always keep these fields if they exist
                         if 'message' in data:
-                            filtered_data['message'] = data['message']
+                            filtered_data['message'] = strip_base64_images(data['message'])
                         if 'timestamp' in data:
                             filtered_data['timestamp'] = data['timestamp']
                         if 'children' in data:
-                            filtered_data['children'] = data['children']
+                            filtered_data['children'] = strip_base64_images(data['children'])
                         
                         # Keep type to understand the structure
                         if 'type' in data:
                             filtered_data['type'] = data['type']
+                        
+                        # Strip images from toolUseResult if present
+                        if 'toolUseResult' in data:
+                            filtered_data['toolUseResult'] = strip_base64_images(data['toolUseResult'])
                         
                         # Only add if we have meaningful content
                         if filtered_data and ('message' in filtered_data or 'type' in filtered_data):
