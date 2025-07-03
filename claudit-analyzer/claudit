@@ -19,4 +19,5 @@ if [ -z "$GEMINI_API_KEY" ]; then
 fi
 
 # Run the analyzer with all arguments passed through
-"$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/analyze_claude_history.py" "$@"
+# No timeout - let it run as long as needed
+exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/analyze_claude_history.py" "$@"
