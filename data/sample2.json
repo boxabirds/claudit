@@ -1,0 +1,15 @@
+{
+    "parentUuid": null,
+    "isSidechain": false,
+    "userType": "external",
+    "cwd": "/Users/julian/Documents/UK Tax Engine -- Making Tax Digital",
+    "sessionId": "d87ee32b-d27e-424e-b7cd-63f5159db608",
+    "version": "1.0.29",
+    "type": "user",
+    "message": {
+        "role": "user",
+        "content": "create a script that merges all the .md files in this directory and all subdirectories, ignoring all other file types. "
+    },
+    "uuid": "a4a762ad-3061-42fe-a29b-ca8c63bf2c30",
+    "timestamp": "2025-06-20T11:26:54.828Z"
+}
