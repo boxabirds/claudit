@@ -7,6 +7,9 @@ import argparse
 import json
 import os
 import sys
+import subprocess
+import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -16,10 +19,16 @@ import tiktoken
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.panel import Panel
+from rich.prompt import Prompt, Confirm
 
 # Constants
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 GEMINI_MODEL = "gemini-2.5-flash"
+
+# Constants for retry mechanism
+MAX_RETRIES = 5
+INITIAL_BACKOFF_SECONDS = 5
 
 # Pricing for Gemini 2.5 Flash (July 2025)
 PRICE_PER_M_INPUT = 0.30
@@ -59,6 +68,58 @@ Merge all content appropriately:
 Keep the same section structure: Significant Decisions, Mistakes, Milestones, and Timeline."""
 
 METADATA_MARKER = "<!-- Last run:"
+
+# Track whether to ignore Google Application Credentials
+IGNORE_GOOGLE_CREDS = False
+
+
+def check_google_credentials() -> None:
+    """Check if GOOGLE_APPLICATION_CREDENTIALS is set and prompt user."""
+    global IGNORE_GOOGLE_CREDS
+    
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        console = Console()
+        console.print("\n[yellow]Warning: GOOGLE_APPLICATION_CREDENTIALS environment variable is set.[/yellow]")
+        console.print("Gemini API may try to use these credentials, which could cause authentication issues if expired.\n")
+        console.print("Options:")
+        console.print("1) Ignore GOOGLE_APPLICATION_CREDENTIALS [default]")
+        console.print("2) Use GOOGLE_APPLICATION_CREDENTIALS")
+        
+        choice = console.input("\nYour choice (1/2) [1]: ").strip()
+        
+        if choice == "" or choice == "1":
+            IGNORE_GOOGLE_CREDS = True
+            console.print("[green]Will ignore GOOGLE_APPLICATION_CREDENTIALS for this session.[/green]\n")
+        else:
+            IGNORE_GOOGLE_CREDS = False
+            console.print("[blue]Using GOOGLE_APPLICATION_CREDENTIALS.[/blue]\n")
+
+
+def get_gemini_client() -> OpenAI:
+    """Get OpenAI client configured for Gemini, handling Google credentials."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("Please set GEMINI_API_KEY environment variable")
+    
+    base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    
+    # If we should ignore Google credentials, temporarily unset them
+    if IGNORE_GOOGLE_CREDS and os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        # Save the original value
+        original_creds = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+        try:
+            client = OpenAI(api_key=api_key, base_url=base_url)
+            # Restore the credentials
+            if original_creds:
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = original_creds
+            return client
+        except Exception as e:
+            # Restore credentials even if there's an error
+            if original_creds:
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = original_creds
+            raise e
+    else:
+        return OpenAI(api_key=api_key, base_url=base_url)
 
 
 def munge_project_path(project_path: str) -> str:
@@ -221,6 +282,73 @@ def strip_base64_images(content: Any) -> Any:
         return content
 
 
+def check_gemini_cli() -> bool:
+    """Check if gemini CLI is installed and available."""
+    return shutil.which("gemini") is not None
+
+
+def install_gemini_cli(console: Console) -> bool:
+    """Offer to install Gemini CLI and return True if successful."""
+    console.print("\n[yellow]Gemini CLI is not installed.[/yellow]")
+    console.print("\nWith Gemini CLI, you can:")
+    console.print("• Use the [bold green]-p[/bold green] flag for free analysis (with Google login)")
+    console.print("• Access a generous free tier that can significantly reduce costs")
+    console.print("• Avoid needing an API key for basic usage")
+    
+    if Confirm.ask("\n[bold]Would you like to install Gemini CLI?[/bold]"):
+        console.print("\nTo install Gemini CLI, run:")
+        console.print("[bold cyan]pip install google-generativeai[/bold cyan]")
+        console.print("\nThen try running this tool again.")
+        return False
+    return False
+
+
+def choose_analysis_method(console: Console) -> str:
+    """Let user choose between Gemini CLI and API."""
+    has_gemini_cli = check_gemini_cli()
+    has_api_key = os.getenv("GEMINI_API_KEY") is not None
+    
+    if not has_gemini_cli and not has_api_key:
+        # No options available
+        if not install_gemini_cli(console):
+            console.print("\n[red]No analysis method available.[/red]")
+            console.print("Either:")
+            console.print("1. Install Gemini CLI: [cyan]pip install google-generativeai[/cyan]")
+            console.print("2. Get an API key from: [cyan]https://aistudio.google.com[/cyan]")
+            console.print("   Then: [cyan]export GEMINI_API_KEY=your_key_here[/cyan]")
+            sys.exit(1)
+    
+    if has_gemini_cli:
+        console.print(Panel.fit(
+            "[bold green]Google Gemini CLI detected![/bold green]\n\n"
+            "If you sign in to Google Gemini with your Google account,\n"
+            "Claudit will probably be able to use the provided free tier.",
+            title="Free Analysis Option Available"
+        ))
+        
+        if has_api_key:
+            # Both options available
+            choice = Prompt.ask(
+                "\nUse Gemini CLI on my behalf (1) or use my GEMINI_API_KEY (2)",
+                choices=["1", "2"],
+                default="1"
+            )
+            return "cli" if choice == "1" else "api"
+        else:
+            # Only CLI available
+            use_cli = Confirm.ask("\nUse Gemini CLI for free analysis?", default=True)
+            if use_cli:
+                return "cli"
+            else:
+                console.print("\n[red]No API key found.[/red]")
+                console.print("Get one from: [cyan]https://aistudio.google.com[/cyan]")
+                console.print("Then: [cyan]export GEMINI_API_KEY=your_key_here[/cyan]")
+                sys.exit(1)
+    
+    # Only API available
+    return "api"
+
+
 def get_last_run_date(report_file: Path) -> Optional[datetime]:
     """Extract the last run date from an existing report."""
     if not report_file.exists():
@@ -373,19 +501,46 @@ def chunk_content(content: str, max_chunk_size: int = 1024 * 1024) -> List[str]:
     return chunks
 
 
-def analyze_chunk_with_gemini(content: str, chunk_num: int, total_chunks: int) -> str:
+def analyze_chunk_with_gemini_cli(content: str, chunk_num: int, total_chunks: int) -> str:
+    """Analyze a chunk using Gemini CLI with -p flag."""
+    import tempfile
+    
+    for attempt in range(MAX_RETRIES):
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            prompt = f"{ANALYSIS_PROMPT}\n\nThis is chunk {chunk_num} of {total_chunks}. Analyze this portion of the conversation:\n\n{content}"
+            f.write(prompt)
+            temp_file = f.name
+        
+        try:
+            # Run gemini CLI with -p flag for free tier
+            # Pass current environment to ensure HOME is available for oauth credentials
+            result = subprocess.run(
+                ["gemini", "-p", temp_file],
+                capture_output=True,
+                text=True,
+                check=True,
+                env=os.environ.copy()
+            )
+            return result.stdout
+        except subprocess.CalledProcessError as e:
+            if "429" in e.stderr or "RESOURCE_EXHAUSTED" in e.stderr:
+                wait_time = INITIAL_BACKOFF_SECONDS * (2 ** attempt)
+                print(f"\nGemini CLI rate limit hit (429). Retrying in {wait_time:.1f} seconds... (Attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(wait_time)
+            else:
+                raise RuntimeError(f"Gemini CLI failed: {e.stderr}")
+    
+    raise RuntimeError(f"Gemini CLI failed after {MAX_RETRIES} attempts due to rate limiting.")
+
+
+def analyze_chunk_with_gemini(content: str, chunk_num: int, total_chunks: int, use_cli: bool = False) -> str:
     """Send a chunk to Gemini for analysis."""
-    # Get API key from environment
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("Please set GEMINI_API_KEY environment variable")
+    if use_cli:
+        result = analyze_chunk_with_gemini_cli(content, chunk_num, total_chunks)
+        time.sleep(1) # Rate limit to 60 requests/minute
+        return result
     
-    base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url
-    )
+    client = get_gemini_client()
     
     response = client.chat.completions.create(
         model=GEMINI_MODEL,
@@ -395,23 +550,49 @@ def analyze_chunk_with_gemini(content: str, chunk_num: int, total_chunks: int) -
         ],
         temperature=0.0
     )
-    
+    time.sleep(1) # Rate limit to 60 requests/minute
     return response.choices[0].message.content
 
 
-def consolidate_reports(subreports: List[str]) -> str:
+def consolidate_reports_with_cli(subreports: List[str]) -> str:
+    """Consolidate reports using Gemini CLI."""
+    import tempfile
+    combined_content = "\n\n---SUBREPORT BOUNDARY---\n\n".join(subreports)
+    
+    for attempt in range(MAX_RETRIES):
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            prompt = f"{CONSOLIDATION_PROMPT}\n\n{combined_content}"
+            f.write(prompt)
+            temp_file = f.name
+        
+        try:
+            result = subprocess.run(
+                ["gemini", "-p", temp_file],
+                capture_output=True,
+                text=True,
+                check=True,
+                env=os.environ.copy()
+            )
+            return result.stdout
+        except subprocess.CalledProcessError as e:
+            if "429" in e.stderr or "RESOURCE_EXHAUSTED" in e.stderr:
+                wait_time = INITIAL_BACKOFF_SECONDS * (2 ** attempt)
+                print(f"\nGemini CLI rate limit hit (429). Retrying in {wait_time:.1f} seconds... (Attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(wait_time)
+            else:
+                raise RuntimeError(f"Gemini CLI failed: {e.stderr}")
+    
+    raise RuntimeError(f"Gemini CLI failed after {MAX_RETRIES} attempts due to rate limiting.")
+
+
+def consolidate_reports(subreports: List[str], use_cli: bool = False) -> str:
     """Consolidate multiple subreports into a final report."""
-    # Get API key from environment
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("Please set GEMINI_API_KEY environment variable")
+    if use_cli:
+        result = consolidate_reports_with_cli(subreports)
+        time.sleep(1) # Rate limit to 60 requests/minute
+        return result
     
-    base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url
-    )
+    client = get_gemini_client()
     
     # Combine all subreports
     combined_content = "\n\n---SUBREPORT BOUNDARY---\n\n".join(subreports)
@@ -426,11 +607,11 @@ def consolidate_reports(subreports: List[str]) -> str:
         ],
         temperature=0.0
     )
-    
+    time.sleep(1) # Rate limit to 60 requests/minute
     return response.choices[0].message.content
 
 
-def select_project_interactive() -> Tuple[str, Path]:
+def select_project_interactive(show_costs: bool = True) -> Tuple[str, Path]:
     """Show list of projects and let user select one."""
     console = Console()
     
@@ -455,26 +636,38 @@ def select_project_interactive() -> Tuple[str, Path]:
     table.add_column("Project Name", style="bright_green")
     table.add_column("Size", style="bright_blue", justify="right")
     table.add_column("Tokens", style="bright_yellow", justify="right")
-    table.add_column("Est. Cost", style="bright_magenta", justify="right")
+    if show_costs:
+        table.add_column("Est. Cost", style="bright_magenta", justify="right")
     
-    # Add rows with cost estimates
+    # Add rows
     for i, (friendly_name, munged_name, _, size_bytes, token_count) in enumerate(projects, 1):
         size_str = format_file_size(size_bytes)
         token_str = format_token_count(token_count)
-        cost = estimate_cost(token_count)
-        cost_str = f"${cost:.2f}"
         
-        table.add_row(
-            str(i),
-            friendly_name,
-            size_str,
-            token_str,
-            cost_str
-        )
+        if show_costs:
+            cost = estimate_cost(token_count)
+            cost_str = f"${cost:.2f}"
+            table.add_row(
+                str(i),
+                friendly_name,
+                size_str,
+                token_str,
+                cost_str
+            )
+        else:
+            table.add_row(
+                str(i),
+                friendly_name,
+                size_str,
+                token_str
+            )
     
     console.print("\n")
     console.print(table)
-    console.print(f"\n[dim]Pricing: ${PRICE_PER_M_INPUT:.2f}/M input tokens, ${PRICE_PER_M_OUTPUT:.2f}/M output tokens (max {MAX_OUTPUT_TOKENS:,} output)[/dim]")
+    if show_costs:
+        console.print(f"\n[dim]Pricing: ${PRICE_PER_M_INPUT:.2f}/M input tokens, ${PRICE_PER_M_OUTPUT:.2f}/M output tokens (max {MAX_OUTPUT_TOKENS:,} output)[/dim]")
+    else:
+        console.print("\n[dim]Using Gemini CLI with -p flag for free analysis[/dim]")
     
     while True:
         try:
@@ -498,9 +691,15 @@ def main():
     parser.add_argument("--output", "-o", help="Output file name (default: analysis_<project_name>.md)")
     args = parser.parse_args()
     
+    console = Console()
+    
+    # Choose analysis method before showing project list
+    analysis_method = choose_analysis_method(console)
+    use_cli = (analysis_method == "cli")
+    
     if not args.project:
         # No argument provided - show interactive selection
-        munged_path, project_dir = select_project_interactive()
+        munged_path, project_dir = select_project_interactive(show_costs=not use_cli)
         project_path = get_full_path_from_munged(munged_path)
     else:
         # Argument provided - could be path or friendly name
@@ -557,6 +756,10 @@ def main():
         
         print(f"\nTotal content size: {len(content)} characters")
         
+        # Check if we need to handle Google credentials (only if not using CLI mode)
+        if not use_cli:
+            check_google_credentials()
+        
         # Get current run time
         current_run_time = datetime.now()
         
@@ -583,40 +786,66 @@ def main():
                         chunk_size_mb = len(chunk.encode('utf-8')) / (1024 * 1024)
                         pbar.set_description(f"Analyzing chunk {i}/{len(chunks)} ({chunk_size_mb:.2f}MB)")
                         
-                        subreport = analyze_chunk_with_gemini(chunk, i, len(chunks))
+                        subreport = analyze_chunk_with_gemini(chunk, i, len(chunks), use_cli)
                         subreports.append(subreport)
                         pbar.update(1)
                 
                 # Consolidate new content reports
-                new_analysis = consolidate_reports(subreports)
+                new_analysis = consolidate_reports(subreports, use_cli)
             else:
                 # Single chunk for new content
                 print("Analyzing new conversations...")
-                new_analysis = analyze_chunk_with_gemini(content, 1, 1)
+                new_analysis = analyze_chunk_with_gemini(content, 1, 1, use_cli)
             
             # Consolidate with existing report
             print("\nMerging with existing report...")
-            api_key = os.getenv("GEMINI_API_KEY")
-            if not api_key:
-                raise ValueError("Please set GEMINI_API_KEY environment variable")
             
-            client = OpenAI(
-                api_key=api_key,
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-            )
-            
-            combined_content = f"PREVIOUS REPORT:\n\n{existing_report}\n\n---NEW CONVERSATIONS ANALYSIS---\n\n{new_analysis}"
-            
-            response = client.chat.completions.create(
-                model=GEMINI_MODEL,
-                messages=[
-                    {"role": "system", "content": DIFFERENTIAL_CONSOLIDATION_PROMPT},
-                    {"role": "user", "content": combined_content}
-                ],
-                temperature=0.0
-            )
-            
-            analysis = response.choices[0].message.content
+            if use_cli:
+                # Use CLI for differential consolidation
+                import tempfile
+                combined_content = f"PREVIOUS REPORT:\n\n{existing_report}\n\n---NEW CONVERSATIONS ANALYSIS---\n\n{new_analysis}"
+                
+                for attempt in range(MAX_RETRIES):
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                        prompt = f"{DIFFERENTIAL_CONSOLIDATION_PROMPT}\n\n{combined_content}"
+                        f.write(prompt)
+                        temp_file = f.name
+                    
+                    try:
+                        result = subprocess.run(
+                            ["gemini", "-p", temp_file],
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                            env=os.environ.copy()
+                        )
+                        analysis = result.stdout
+                        break # Exit retry loop on success
+                    except subprocess.CalledProcessError as e:
+                        if "429" in e.stderr or "RESOURCE_EXHAUSTED" in e.stderr:
+                            wait_time = INITIAL_BACKOFF_SECONDS * (2 ** attempt)
+                            print(f"\nGemini CLI rate limit hit (429). Retrying in {wait_time:.1f} seconds... (Attempt {attempt + 1}/{MAX_RETRIES})")
+                            time.sleep(wait_time)
+                        else:
+                            raise RuntimeError(f"Gemini CLI failed: {e.stderr}")
+                else:
+                    raise RuntimeError(f"Gemini CLI failed after {MAX_RETRIES} attempts due to rate limiting.")
+            else:
+                # Use API for differential consolidation
+                client = get_gemini_client()
+                
+                combined_content = f"PREVIOUS REPORT:\n\n{existing_report}\n\n---NEW CONVERSATIONS ANALYSIS---\n\n{new_analysis}"
+                
+                response = client.chat.completions.create(
+                    model=GEMINI_MODEL,
+                    messages=[
+                        {"role": "system", "content": DIFFERENTIAL_CONSOLIDATION_PROMPT},
+                        {"role": "user", "content": combined_content}
+                    ],
+                    temperature=0.0
+                )
+                time.sleep(1) # Rate limit to 60 requests/minute
+                analysis = response.choices[0].message.content
             
         else:
             # Full analysis mode (same as before)
@@ -625,7 +854,7 @@ def main():
             
             if num_chunks == 1:
                 print("Content fits in a single chunk, analyzing directly...")
-                analysis = analyze_chunk_with_gemini(chunks[0], 1, 1)
+                analysis = analyze_chunk_with_gemini(chunks[0], 1, 1, use_cli)
                 subreports = [analysis]
             else:
                 print(f"\nContent split into {num_chunks} chunks for analysis.")
@@ -637,7 +866,7 @@ def main():
                         chunk_size_mb = len(chunk.encode('utf-8')) / (1024 * 1024)
                         pbar.set_description(f"Analyzing chunk {i}/{num_chunks} ({chunk_size_mb:.2f}MB)")
                         
-                        subreport = analyze_chunk_with_gemini(chunk, i, num_chunks)
+                        subreport = analyze_chunk_with_gemini(chunk, i, num_chunks, use_cli)
                         
                         # Save subreport
                         if args.output:
@@ -654,7 +883,7 @@ def main():
                         pbar.update(1)
                 
                 # Consolidate reports
-                analysis = consolidate_reports(subreports)
+                analysis = consolidate_reports(subreports, use_cli)
         
         # Save the final analysis with metadata
         with open(output_file, 'w') as f:
