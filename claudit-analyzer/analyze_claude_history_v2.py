@@ -4,6 +4,7 @@ Analyze Claude conversation history to extract significant decisions, mistakes, 
 or to identify behavioral rules for improvement.
 """
 
+import threading
 import argparse
 import json
 import os
@@ -48,6 +49,15 @@ MAX_OUTPUT_TOKENS = 65_535  # Conservative estimate for output
 METADATA_MARKER = "<!-- Last run:"
 CACHE_MARKER = "<!-- Cache updated:"
 PROJECTS_CACHE_FILE = "projects_cache.json"
+
+class SubProcessExecutionResult:
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+    
+    # take stderror raw text and figure out what the error was
+    
 
 
 class ConversationAnalyzer(ABC):
@@ -509,72 +519,79 @@ class ConversationAnalyzer(ABC):
         return chunks
     
     
-    def run_gemini_cli_with_logging(self, cmd: List[str], input_text: str, attempt: int) -> subprocess.CompletedProcess:
-        """Run gemini CLI command - simple and direct."""
+    def run_analysis_with_gemini_cli(self,  input_text: str, attempt: int) -> tuple[SubProcessExecutionResult,int]:
+    
+        prompt = self.get_analysis_prompt()
+        GEMINI_CLI_CMD = ["gemini", "-m", "gemini-2.5-flash", "-p", prompt]
         print(f"\n[blue]═══ Gemini CLI Call (Attempt {attempt + 1}/{MAX_RETRIES}) ═══[/blue]", flush=True)
-        print(f"[dim]Command: {' '.join(cmd)}[/dim]", flush=True)
+        print(f"[dim]Command: {' '.join(GEMINI_CLI_CMD)}[/dim]", flush=True)
         print(f"[dim]Input length: {len(input_text)} characters[/dim]", flush=True)
         
-        # Simple: just run it with stdin
         try:
-            # Create a clean environment without GOOGLE_APPLICATION_CREDENTIALS
-            # We must create a new env dict, not modify os.environ
-            clean_env = {}
-            for key, value in os.environ.items():
-                if key != "GOOGLE_APPLICATION_CREDENTIALS":
-                    clean_env[key] = value
-            
+            # Create a clean environment without GOOGLE_APPLICATION_CREDENTIALS which overrides our 
+            # 'normal' Google Login credentials -- and we miss out on the goodie bag that comes with that tier
+            # This took hours to figure out. It shouldn't have. 
+            clean_env = os.environ.copy()
+            clean_env.pop("GOOGLE_APPLICATION_CREDENTIALS", None)            
             print(f"[dim]Environment has {len(clean_env)} vars (removed GOOGLE_APPLICATION_CREDENTIALS)[/dim]", flush=True)
+
+            # Always good to catch performance data. 
+            start_time = time.time()
             
-            result = subprocess.run(
-                cmd,
-                input=input_text,
-                capture_output=True,
+            # Use Popen for real-time output -- incredibly hard to figure out what goes on 
+            # when running the gemini CLI command otherwise. It becomes an impenetrable black box
+            # that causes you hours of misery. Don't repeat my mistakes: Popen is your friend!
+            proc = subprocess.Popen(
+                GEMINI_CLI_CMD, 
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 env=clean_env,
-                timeout=GEMINI_CLI_TIMEOUT
+                bufsize=1,  # Line buffered
+                universal_newlines=True
             )
             
-            print(f"[green]Command completed with exit code: {result.returncode}[/green]", flush=True)
-            print(f"[dim]Output length: {len(result.stdout)} chars[/dim]", flush=True)
+            # Write input and close stdin
+            print("--- Writing input to subprocess stdin ---", flush=True)
+            proc.stdin.write(input_text)
+            proc.stdin.close()
             
+            print("\n--- Subprocess output (real-time) ---", flush=True)
             
-            if result.returncode != 0:
-                print(f"\n[red]Full stdout:[/red]")
-                print(result.stdout)
-                raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
-                
-            return result
+            # All processes produce output in two places: "standard out" and "standard error"
+            # We just merge them. 
+            output_lines = []
+            error_lines = []
             
-        except subprocess.TimeoutExpired as e:
-            print(f"[red]TIMEOUT after {GEMINI_CLI_TIMEOUT} seconds![/red]", flush=True)
-            print(f"[red]The gemini command is hanging. Input file preserved at: {input_file}[/red]")
-            print(f"[yellow]Test manually with:[/yellow]")
-            print(f"[yellow]cat {input_file} | gemini -m gemini-2.5-flash[/yellow]")
-            print(f"[yellow]Or check the file exists: ls -la {input_file}[/yellow]")
-            # Don't delete the file on timeout so user can debug
-            raise
-        except subprocess.CalledProcessError as e:
-            print(f"[red]Command failed with exit code {e.returncode}[/red]", flush=True)
-            if e.stdout:
-                print(f"[red]Stdout output:[/red]")
-                print(e.stdout)
-            if e.stderr:
-                print(f"[red]Stderr output:[/red]")
-                print(e.stderr)
-            print(f"[yellow]Input file preserved at: {input_file}[/yellow]")
-            raise
-        finally:
-            # Only clean up temp file on success
-            if 'result' in locals() and result.returncode == 0:
-                try:
-                    os.unlink(input_file)
-                    print(f"[dim]Cleaned up temp file: {input_file}[/dim]")
-                except:
-                    pass
-            else:
-                print(f"[yellow]Input file preserved for debugging: {input_file}[/yellow]")
-    
+            def read_stream(stream, lines, prefix):
+                # inline / local functions are pythonic apparently. But in an inner loop? 🤔
+                for line in stream:
+                    print(f"[{prefix}]: {line}", end='', flush=True)
+                    lines.append(line)
+            
+            # Start threads for reading
+            stdout_thread = threading.Thread(target=read_stream, args=(proc.stdout, output_lines, "stdout"))
+            stderr_thread = threading.Thread(target=read_stream, args=(proc.stderr, error_lines, "stderr"))
+            
+            stdout_thread.start()
+            stderr_thread.start()
+            
+            # Wait FOREVER 🧙‍♂️ for process to complete
+            return_code = proc.wait()
+            
+            # Wait for threads to finish reading
+            stdout_thread.join()
+            stderr_thread.join()
+            
+            elapsed_time = time.time() - start_time
+            
+            print(f"\n--- Process completed with exit code: {return_code} ---", flush=True)
+            print(f"Output length: {len(''.join(output_lines))} chars", flush=True)
+            print(f"Processing time: {elapsed_time:.2f}")
+
+            result = SubProcessExecutionResult(return_code, ''.join(output_lines), ''.join(error_lines))
+ 
     
     def analyze_chunk_with_gemini_cli(self, content: str, chunk_num: int, total_chunks: int) -> str:
         """Analyze a chunk using Gemini CLI."""
@@ -584,13 +601,9 @@ class ConversationAnalyzer(ABC):
         for attempt in range(MAX_RETRIES):
             try:
                 # Prepare the full prompt content
-                full_prompt = f"{prompt}\n\nThis is chunk {chunk_num} of {total_chunks}. Analyze this portion of the conversation:\n\n{content}"
+                full_prompt = f"This is chunk {chunk_num} of {total_chunks}. Analyze this portion of the conversation:\n\n{content}"
                 
-                # Build command with flash model to avoid Pro quota issues
-                cmd = ["gemini", "-m", "gemini-2.5-flash"]
-                
-                # Use the logging wrapper - pass content directly via stdin
-                result = self.run_gemini_cli_with_logging(cmd, full_prompt, attempt)
+                result, execution_time_in_millis = self.run_analysis_with_gemini_cli(full_prompt, attempt)
                 
                 return result.stdout
             except subprocess.TimeoutExpired as e:

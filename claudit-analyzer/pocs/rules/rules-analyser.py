@@ -71,10 +71,8 @@ def estimate_tokens(text, model="cl100k_base"):
         return None
 
 def run(cmd, input_text):
-    clean_env = {}
-    for key, value in os.environ.items():
-        if key != "GOOGLE_APPLICATION_CREDENTIALS":
-            clean_env[key] = value
+    clean_env = os.environ.copy()
+    clean_env.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
     
     print(f"Environment has {len(clean_env)} vars (removed GOOGLE_APPLICATION_CREDENTIALS)", flush=True)
     print(f"Running command: {' '.join(cmd)}", flush=True)
