@@ -20,4 +20,4 @@ fi
 
 # Run the analyzer with all arguments passed through
 # No timeout - let it run as long as needed
-exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/analyze_claude_history.py" "$@"
+exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/analyze_claude_history_v2.py" "$@"

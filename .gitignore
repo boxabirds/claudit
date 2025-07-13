@@ -211,3 +211,6 @@ __marimo__/
 
 # Temporary directory
 tmp/
+
+# Project cache
+reports/projects_cache.json
