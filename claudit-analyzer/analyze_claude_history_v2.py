@@ -57,7 +57,7 @@ class SubProcessExecutionResult:
         self.stderr = stderr
     
     # take stderror raw text and figure out what the error was
-    
+
 
 
 class ConversationAnalyzer(ABC):
@@ -519,10 +519,9 @@ class ConversationAnalyzer(ABC):
         return chunks
     
     
-    def run_analysis_with_gemini_cli(self,  input_text: str, attempt: int) -> tuple[SubProcessExecutionResult,int]:
+    def run_analysis_with_gemini_cli(self, system_prompt: str, input_text: str, attempt: int) -> tuple[SubProcessExecutionResult,int]:
     
-        prompt = self.get_analysis_prompt()
-        GEMINI_CLI_CMD = ["gemini", "-m", "gemini-2.5-flash", "-p", prompt]
+        GEMINI_CLI_CMD = ["gemini", "-m", "gemini-2.5-flash", "-p", system_prompt]
         print(f"\n[blue]═══ Gemini CLI Call (Attempt {attempt + 1}/{MAX_RETRIES}) ═══[/blue]", flush=True)
         print(f"[dim]Command: {' '.join(GEMINI_CLI_CMD)}[/dim]", flush=True)
         print(f"[dim]Input length: {len(input_text)} characters[/dim]", flush=True)
@@ -596,14 +595,13 @@ class ConversationAnalyzer(ABC):
     def analyze_chunk_with_gemini_cli(self, content: str, chunk_num: int, total_chunks: int) -> str:
         """Analyze a chunk using Gemini CLI."""
         print(f"\n[ENTER] analyze_chunk_with_gemini_cli for chunk {chunk_num}/{total_chunks}", flush=True)
-        prompt = self.get_analysis_prompt()
         
+        system_prompt = self.get_analysis_prompt()
         for attempt in range(MAX_RETRIES):
             try:
                 # Prepare the full prompt content
-                full_prompt = f"This is chunk {chunk_num} of {total_chunks}. Analyze this portion of the conversation:\n\n{content}"
-                
-                result, execution_time_in_millis = self.run_analysis_with_gemini_cli(full_prompt, attempt)
+                input = f"This is chunk {chunk_num} of {total_chunks}. Analyze this portion of the conversation:\n\n{content}"
+                result, execution_time_in_millis = self.run_analysis_with_gemini_cli(system_prompt, input, attempt)
                 
                 return result.stdout
             except subprocess.TimeoutExpired as e:
@@ -682,19 +680,15 @@ class ConversationAnalyzer(ABC):
     
     def consolidate_reports_with_cli(self, subreports: List[str]) -> str:
         """Consolidate reports using Gemini CLI."""
+
+        # TODO we need to keep an eye on the input length of the subreports -- the consolidated output can't be > max output tokens (which in some LLMs is very limited)
         combined_content = "\n\n---SUBREPORT BOUNDARY---\n\n".join(subreports)
-        prompt = self.get_consolidation_prompt()
+        system_prompt = self.get_consolidation_prompt()
         
         for attempt in range(MAX_RETRIES):
             try:
-                # Prepare the full prompt content
-                full_prompt = f"{prompt}\n\n{combined_content}"
-                
-                # Build command with flash model to avoid Pro quota issues
-                cmd = ["gemini", "-m", "gemini-2.5-flash"]
-
                 # Use the logging wrapper - pass content directly via stdin
-                result = self.run_gemini_cli_with_logging(cmd, full_prompt, attempt)
+                result, elapsed_time_in_millis = self.run_analysis_with_gemini_cli(system_prompt, combined_content, attempt)
                 
                 return result.stdout
             except subprocess.TimeoutExpired as e:
